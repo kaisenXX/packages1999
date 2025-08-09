@@ -1,0 +1,578 @@
+assuming gpu shit work (cuda version 12.9 python version 3.11)
+https://download.pytorch.org/whl/cu129/torch-2.8.0%2Bcu129-cp311-cp311-win_amd64.whl#sha256=8a92b6ac49be932a8e4f70282d0d396a95a0fc877a9fbe0bd36be5f765707c84
+
+torch vision 
+https://download.pytorch.org/whl/cu129/torchvision-0.23.0%2Bcu129-cp311-cp311-win_amd64.whl#sha256=9e4080da290061ce8bf8169e8e74b39276c81ed790a4ff4947703a6c5bd2c8fb
+
+torchaudio
+https://download.pytorch.org/whl/cu129/torchaudio-2.8.0%2Bcu129-cp311-cp311-win_amd64.whl#sha256=964e442feb548bb373e3fe9fae64a8cc3e413e4855bbd82aa9e8897966f700ae
+
+numpy
+https://files.pythonhosted.org/packages/d5/03/0eade211c504bda872a594f045f98ddcc6caef2b7c63610946845e304d3f/numpy-2.3.2-cp311-cp311-win_amd64.whl
+
+pillow
+https://files.pythonhosted.org/packages/f1/cc/29c0f5d64ab8eae20f3232da8f8571660aa0ab4b8f1331da5c2f5f9a938e/pillow-11.3.0-cp311-cp311-win_amd64.whl
+
+matplotlib
+https://files.pythonhosted.org/packages/b7/81/3200b792a5e8b354f31f4101ad7834743ad07b6d620259f2059317b25e4d/matplotlib-3.10.5-cp311-cp311-win_amd64.whl
+
+opencv-python
+https://files.pythonhosted.org/packages/fa/80/eb88edc2e2b11cd2dd2e56f1c80b5784d11d6e6b7f04a1145df64df40065/opencv_python-4.12.0.88-cp37-abi3-win_amd64.whl
+
+tqdm
+https://files.pythonhosted.org/packages/d0/30/dc54f88dd4a2b5dc8a0279bdd7270e735851848b762aeb1c1184ed1f6b14/tqdm-4.67.1-py3-none-any.whl
+
+scipy
+https://files.pythonhosted.org/packages/c4/94/994369978509f227cba7dfb9e623254d0d5559506fe994aef4bea3ed469c/scipy-1.16.1-cp311-cp311-win_amd64.whl
+eniops
+https://files.pythonhosted.org/packages/87/62/9773de14fe6c45c23649e98b83231fffd7b9892b6cf863251dc2afa73643/einops-0.8.1-py3-none-any.whl
+
+
+#torch.load('models/MISR/EDVR/experiments/pretrained_models/EDVR_L_x4_SR_REDS_official-9f5f5039.pth')
+#
+#
+basicsr
+https://files.pythonhosted.org/packages/8c/ac/74f4e34fdbc7d3d9233a6f02a740ddb446d75551fbb6ed0c4243c4511a86/basicsr-1.3.3.4.tar.gz
+
+order of downloading is 
+numpy
+
+Pillow (for image reading/saving)
+
+scipy (used in some image processing)
+
+matplotlib (for plotting and visualization)
+
+tqdm (progress bars, optional)
+
+opencv-python (for advanced image/video processing)
+
+torch (PyTorch core)
+
+torchvision (PyTorch vision utilities, models, transforms)
+
+torchaudio (if you need audio, otherwise optional)
+
+
+Python code
+import os
+import glob
+import random
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+import torchvision.transforms as transforms
+import torchvision.models as models
+
+# --- Dataset Class ---
+class SRDataset(Dataset):
+    def __init__(self, hr_folder, scale=2, patch_size=100, transform=None):
+        super().__init__()
+        self.hr_images = sorted(glob.glob(os.path.join(hr_folder, '*.*')))
+        self.scale = scale
+        self.patch_size = patch_size
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.hr_images)
+
+    def __getitem__(self, idx):
+        hr_img = Image.open(self.hr_images[idx]).convert('L')  # GRAYSCALE
+
+        # Random crop HR patch
+        w, h = hr_img.size
+        if w < self.patch_size * self.scale or h < self.patch_size * self.scale:
+            hr_img = hr_img.resize((self.patch_size * self.scale, self.patch_size * self.scale), Image.BICUBIC)
+            w, h = hr_img.size
+
+        left = random.randint(0, w - self.patch_size * self.scale)
+        top = random.randint(0, h - self.patch_size * self.scale)
+        hr_patch = hr_img.crop((left, top, left + self.patch_size * self.scale, top + self.patch_size * self.scale))
+
+        # Generate LR by downsampling HR patch
+        lr_patch = hr_patch.resize((self.patch_size, self.patch_size), Image.BICUBIC)
+
+        if self.transform:
+            hr_patch = self.transform(hr_patch)
+            lr_patch = self.transform(lr_patch)
+        else:
+            to_tensor = transforms.ToTensor()
+            hr_patch = to_tensor(hr_patch)
+            lr_patch = to_tensor(lr_patch)
+
+        return lr_patch, hr_patch
+
+# --- VDSR Model ---
+class VDSR(nn.Module):
+    def __init__(self, num_channels=1, num_layers=20):
+        super(VDSR, self).__init__()
+        kernel_size = 3
+        padding = 1
+        features = 64
+
+        layers = []
+        layers.append(nn.Conv2d(num_channels, features, kernel_size, padding=padding, bias=True))
+        layers.append(nn.ReLU(inplace=True))
+
+        for _ in range(num_layers - 2):
+            layers.append(nn.Conv2d(features, features, kernel_size, padding=padding, bias=True))
+            layers.append(nn.BatchNorm2d(features))
+            layers.append(nn.ReLU(inplace=True))
+
+        layers.append(nn.Conv2d(features, num_channels, kernel_size, padding=padding, bias=True))
+
+        self.body = nn.Sequential(*layers)
+
+    def forward(self, x):
+        residual = self.body(x)
+        out = x + residual
+        return out
+
+# --- VGG Loss (Optional, can skip for grayscale or use L1/MSE only) ---
+class VGGLoss(nn.Module):
+    def __init__(self):
+        super(VGGLoss, self).__init__()
+        vgg_features = models.vgg19(pretrained=True).features[:36].eval()
+        for param in vgg_features.parameters():
+            param.requires_grad = False
+        self.vgg = vgg_features
+        self.criterion = nn.L1Loss()
+
+    def forward(self, x, y):
+        x_vgg = self.vgg(x.repeat(1,3,1,1))  # repeat grayscale to 3 channels for VGG
+        y_vgg = self.vgg(y.repeat(1,3,1,1))
+        loss = self.criterion(x_vgg, y_vgg)
+        return loss
+
+# --- Save output images ---
+def save_sr_images(sr_batch, output_folder, batch_idx, scale=2):
+    os.makedirs(output_folder, exist_ok=True)
+    sr_batch = sr_batch.cpu().detach()
+    for i, img_tensor in enumerate(sr_batch):
+        img = img_tensor.squeeze(0).clamp(0,1).numpy() * 255
+        img = img.astype(np.uint8)
+        img_pil = Image.fromarray(img, mode='L')
+        img_pil.save(os.path.join(output_folder, f'epoch_batch{batch_idx}_img{i}.png'))
+
+# --- Training function ---
+def train(model, train_loader, val_loader, epochs, device, save_path, output_folder):
+    criterion_mse = nn.MSELoss()
+    criterion_vgg = VGGLoss().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    best_psnr = 0
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0
+        for batch_idx, (lr, hr) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} - Training")):
+            lr, hr = lr.to(device), hr.to(device)
+            optimizer.zero_grad()
+            sr = model(lr)
+            loss_mse = criterion_mse(sr, hr)
+            loss_vgg = criterion_vgg(sr, hr)
+            loss = loss_mse + 0.01 * loss_vgg
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+        avg_loss = running_loss / len(train_loader)
+        print(f"Epoch {epoch+1} Training Loss: {avg_loss:.6f}")
+
+        # Validation and save SR images to disk
+        model.eval()
+        psnr_total = 0
+        with torch.no_grad():
+            for batch_idx, (lr, hr) in enumerate(val_loader):
+                lr, hr = lr.to(device), hr.to(device)
+                sr = model(lr)
+                mse = criterion_mse(sr, hr).item()
+                psnr = 10 * np.log10(1 / mse)
+                psnr_total += psnr
+
+                # Save SR images to disk for first batch only to limit I/O
+                if batch_idx == 0:
+                    save_sr_images(sr, output_folder, epoch)
+
+        avg_psnr = psnr_total / len(val_loader)
+        print(f"Epoch {epoch+1} Validation PSNR: {avg_psnr:.2f} dB")
+
+        # Save best model
+        if avg_psnr > best_psnr:
+            best_psnr = avg_psnr
+            torch.save(model.state_dict(), save_path)
+            print(f"Best model saved with PSNR: {best_psnr:.2f} dB")
+
+# --- Main ---
+if __name__ == "__main__":
+    hr_folder = r"C:/Users/sachi/Desktop/test3/HR"
+    save_model_path = r"C:/Users/sachi/Desktop/test3/vdsr_best.pth"
+    output_sr_folder = r"C:/Users/sachi/Desktop/test3/sr_outputs"
+
+    scale = 2
+    patch_size = 100
+    batch_size = 16
+    epochs = 100
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    full_dataset = SRDataset(hr_folder, scale=scale, patch_size=patch_size, transform=transform)
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    model = VDSR(num_channels=1, num_layers=20).to(device)
+
+    train(model, train_loader, val_loader, epochs, device, save_model_path, output_sr_folder)
+
+# second python code which add data augmentor here
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, IterableDataset
+import torchvision.transforms.functional as TF
+from torchvision.models import vgg16
+import os
+from PIL import Image
+import random
+import glob
+
+# --- VDSR model for grayscale ---
+
+class VDSR(nn.Module):
+    def __init__(self, num_channels=1):
+        super(VDSR, self).__init__()
+        self.residual_layer = nn.Sequential(
+            nn.Conv2d(num_channels, 64, kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            *[nn.Sequential(nn.Conv2d(64, 64, 3, 1, 1, bias=True), nn.ReLU(inplace=True)) for _ in range(18)],
+            nn.Conv2d(64, num_channels, 3, 1, 1, bias=True)
+        )
+    
+    def forward(self, x):
+        residual = self.residual_layer(x)
+        return x + residual
+
+# --- Perceptual loss with VGG (optional) ---
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        vgg = vgg16(pretrained=True).features[:16].eval()
+        for param in vgg.parameters():
+            param.requires_grad = False
+        self.vgg = vgg
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1)
+
+    def forward(self, sr, hr):
+        # sr, hr: grayscale [B,1,H,W], replicate channel to 3 for VGG
+        sr_rgb = sr.repeat(1,3,1,1)
+        hr_rgb = hr.repeat(1,3,1,1)
+        # normalize
+        sr_norm = (sr_rgb - self.mean.to(sr.device)) / self.std.to(sr.device)
+        hr_norm = (hr_rgb - self.mean.to(hr.device)) / self.std.to(hr.device)
+        return nn.functional.mse_loss(self.vgg(sr_norm), self.vgg(hr_norm))
+
+# --- Dataset generator and IterableDataset from earlier ---
+
+def random_flip_rotate(img):
+    if random.random() > 0.5:
+        img = TF.hflip(img)
+    if random.random() > 0.5:
+        img = TF.vflip(img)
+    angle = random.choice([0,90,180,270])
+    if angle != 0:
+        img = TF.rotate(img, angle)
+    return img
+
+def random_brightness_contrast(img):
+    brightness_factor = random.uniform(0.9, 1.1)
+    contrast_factor = random.uniform(0.9, 1.1)
+    img = TF.adjust_brightness(img, brightness_factor)
+    img = TF.adjust_contrast(img, contrast_factor)
+    return img
+
+def dataset_generator(hr_folder, patch_size=100, scale=2):
+    hr_images = sorted(glob.glob(os.path.join(hr_folder, '*.*')))
+    while True:
+        for img_path in hr_images:
+            hr_img = Image.open(img_path).convert('L')
+            w, h = hr_img.size
+            if w < patch_size * scale or h < patch_size * scale:
+                hr_img = hr_img.resize((patch_size * scale, patch_size * scale), Image.BICUBIC)
+                w, h = hr_img.size
+            left = random.randint(0, w - patch_size * scale)
+            top = random.randint(0, h - patch_size * scale)
+            hr_patch = hr_img.crop((left, top, left + patch_size * scale, top + patch_size * scale))
+            hr_patch = random_flip_rotate(hr_patch)
+            hr_patch = random_brightness_contrast(hr_patch)
+            lr_patch = hr_patch.resize((patch_size, patch_size), Image.BICUBIC)
+            hr_tensor = TF.to_tensor(hr_patch)
+            lr_tensor = TF.to_tensor(lr_patch)
+            yield lr_tensor, hr_tensor
+
+from torch.utils.data import IterableDataset
+class IterableSRDataset(IterableDataset):
+    def __init__(self, hr_folder, patch_size=100, scale=2):
+        super().__init__()
+        self.gen = dataset_generator(hr_folder, patch_size, scale)
+    def __iter__(self):
+        return self.gen
+
+# --- Training Loop ---
+
+def train_vdsr(hr_folder, epochs=50, batch_size=16, patch_size=100, scale=2, lr=1e-4, device='cuda'):
+
+    device = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+    dataset = IterableSRDataset(hr_folder, patch_size=patch_size, scale=scale)
+    dataloader = DataLoader(dataset, batch_size=batch_size)
+
+    model = VDSR(num_channels=1).to(device)
+    criterion_mse = nn.MSELoss()
+    criterion_vgg = VGGPerceptualLoss().to(device)  # comment out if no perceptual loss
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    save_dir = "trained_models"
+    os.makedirs(save_dir, exist_ok=True)
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0
+        for i, (lr_batch, hr_batch) in enumerate(dataloader):
+            lr_batch = lr_batch.to(device)
+            hr_batch = hr_batch.to(device)
+
+            optimizer.zero_grad()
+            sr_batch = model(lr_batch)
+
+            loss_mse = criterion_mse(sr_batch, hr_batch)
+            loss_vgg = criterion_vgg(sr_batch, hr_batch)
+            loss = loss_mse + 0.01 * loss_vgg  # weight perceptual loss
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+            if i % 50 == 0:
+                print(f"Epoch {epoch+1}/{epochs}, Step {i}, Loss: {running_loss/(i+1):.6f}")
+
+            # Optional: limit steps per epoch to save time
+            if i >= 500:  # e.g. 500 batches per epoch
+                break
+
+        # Save model checkpoint
+        torch.save(model.state_dict(), os.path.join(save_dir, f"vdsr_epoch{epoch+1}.pth"))
+
+    print("Training completed.")
+
+# --- Usage ---
+
+hr_folder = r"C:/Users/sachi/Desktop/test3/HR"  # your HR folder path here
+train_vdsr(hr_folder=hr_folder, epochs=50, batch_size=16, patch_size=100, scale=2, lr=1e-4, device='cuda')
+
+
+# deep 20  convolution layer
+import os
+import glob
+import random
+from PIL import Image
+import numpy as np
+
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms.functional as TF
+from torchvision.models import vgg16
+import torch.optim as optim
+
+
+# -------- Dataset --------
+class GrayscaleSRDataset(Dataset):
+    def __init__(self, hr_dir, scale=2, patch_size=64, augment=True):
+        self.hr_files = sorted(glob.glob(os.path.join(hr_dir, '*.png')))  # Adjust extension if needed
+        self.scale = scale
+        self.patch_size = patch_size
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.hr_files)
+
+    def __getitem__(self, idx):
+        hr = Image.open(self.hr_files[idx]).convert('L')
+
+        # Random crop HR patch
+        hr_width, hr_height = hr.size
+        if hr_width < self.patch_size * self.scale or hr_height < self.patch_size * self.scale:
+            # Resize if image smaller than patch needed
+            hr = hr.resize((self.patch_size * self.scale, self.patch_size * self.scale), Image.BICUBIC)
+            hr_width, hr_height = hr.size
+
+        x = random.randint(0, hr_width - self.patch_size * self.scale)
+        y = random.randint(0, hr_height - self.patch_size * self.scale)
+        hr_patch = hr.crop((x, y, x + self.patch_size * self.scale, y + self.patch_size * self.scale))
+
+        # Generate LR by downsampling HR patch
+        lr_patch = hr_patch.resize((self.patch_size, self.patch_size), Image.BICUBIC)
+
+        # Upscale LR back to HR size (bicubic interpolation) - input to model
+        lr_upscaled = lr_patch.resize((self.patch_size * self.scale, self.patch_size * self.scale), Image.BICUBIC)
+
+        # Augmentations
+        if self.augment:
+            if random.random() > 0.5:
+                lr_upscaled = TF.hflip(lr_upscaled)
+                hr_patch = TF.hflip(hr_patch)
+            if random.random() > 0.5:
+                lr_upscaled = TF.vflip(lr_upscaled)
+                hr_patch = TF.vflip(hr_patch)
+            if random.random() > 0.5:
+                lr_upscaled = lr_upscaled.rotate(90)
+                hr_patch = hr_patch.rotate(90)
+
+        # To tensor, normalize to [0,1]
+        lr_tensor = TF.to_tensor(lr_upscaled)
+        hr_tensor = TF.to_tensor(hr_patch)
+
+        return lr_tensor, hr_tensor
+
+
+# -------- VDSR Model --------
+class VDSR(nn.Module):
+    def __init__(self, num_channels=1, num_features=64, num_layers=20):
+        super().__init__()
+        layers = []
+        layers.append(nn.Conv2d(num_channels, num_features, kernel_size=3, padding=1, bias=True))
+        layers.append(nn.ReLU(inplace=True))
+        for _ in range(num_layers - 2):
+            layers.append(nn.Conv2d(num_features, num_features, kernel_size=3, padding=1, bias=True))
+            layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Conv2d(num_features, num_channels, kernel_size=3, padding=1, bias=True))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        residual = self.net(x)
+        return x + residual
+
+
+# -------- Perceptual Loss (VGG-based) --------
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        vgg = vgg16(pretrained=True).features[:16].eval()  # Up to relu3_3
+        for param in vgg.parameters():
+            param.requires_grad = False
+        self.vgg = vgg
+        self.criterion = nn.L1Loss()
+
+    def forward(self, sr, hr):
+        # replicate grayscale to 3 channels for VGG
+        sr_3 = sr.repeat(1, 3, 1, 1)
+        hr_3 = hr.repeat(1, 3, 1, 1)
+        sr_vgg = self.vgg(sr_3)
+        hr_vgg = self.vgg(hr_3)
+        loss = self.criterion(sr_vgg, hr_vgg)
+        return loss
+
+
+# -------- Training loop --------
+def train_vdsr(hr_dir, scale=2, patch_size=64, batch_size=16, epochs=100, lr=1e-3, device='cuda'):
+    dataset = GrayscaleSRDataset(hr_dir, scale=scale, patch_size=patch_size, augment=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+    model = VDSR().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion_mse = nn.MSELoss()
+    criterion_vgg = VGGPerceptualLoss().to(device)
+    use_perceptual = True
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = 0
+        for lr_imgs, hr_imgs in dataloader:
+            lr_imgs = lr_imgs.to(device)
+            hr_imgs = hr_imgs.to(device)
+
+            optimizer.zero_grad()
+            sr = model(lr_imgs)
+            loss_mse = criterion_mse(sr, hr_imgs)
+            if use_perceptual:
+                loss_vgg = criterion_vgg(sr, hr_imgs)
+                loss = loss_mse + 0.01 * loss_vgg
+            else:
+                loss = loss_mse
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * lr_imgs.size(0)
+
+        epoch_loss = running_loss / len(dataset)
+        print(f"Epoch [{epoch}/{epochs}] Loss: {epoch_loss:.6f}")
+
+        # Save checkpoint every 10 epochs
+        if epoch % 10 == 0:
+            torch.save(model.state_dict(), f"vdsr_epoch{epoch}.pth")
+
+    return model
+
+
+# -------- Inference --------
+def super_resolve(model, lr_img_path, scale=2, device='cuda'):
+    model.eval()
+    model.to(device)
+
+    lr_img = Image.open(lr_img_path).convert('L')
+    # Upscale with bicubic interpolation
+    upscaled_img = lr_img.resize((lr_img.width * scale, lr_img.height * scale), Image.BICUBIC)
+    input_tensor = TF.to_tensor(upscaled_img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = model(input_tensor)
+
+    output_img = output.squeeze(0).cpu().clamp(0, 1)
+    output_img = TF.to_pil_image(output_img)
+    return output_img
+
+
+# ======= Example Usage =======
+if __name__ == "__main__":
+    # Paths
+    hr_images_folder = r"C:\Users\sachi\Desktop\satellite_cropped_aircraft\HR"
+    test_lr_image_path = r"C:\Users\sachi\Desktop\satellite_cropped_aircraft\test_lr.png"
+    output_sr_path = r"C:\Users\sachi\Desktop\satellite_cropped_aircraft\sr_result.png"
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Train model
+    trained_model = train_vdsr(
+        hr_dir=hr_images_folder,
+        scale=2,
+        patch_size=64,
+        batch_size=16,
+        epochs=100,
+        lr=1e-3,
+        device=device,
+    )
+
+    # Save final model
+    torch.save(trained_model.state_dict(), "vdsr_final.pth")
+
+    # Inference on new LR image
+    sr_img = super_resolve(trained_model, test_lr_image_path, scale=2, device=device)
+    sr_img.save(output_sr_path)
+    print(f"Super-resolved image saved at {output_sr_path}")
+
+##
