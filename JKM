@@ -1,0 +1,225 @@
+import os
+import glob
+import random
+import numpy as np
+from PIL import Image, ImageFilter
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import torchvision.transforms as T
+import torchvision.models as models
+
+# =====================
+# Dataset
+# =====================
+class AircraftDataset(Dataset):
+    def __init__(self, folder):
+        self.files = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".jpg")]
+        self.hr_transform = T.Compose([
+            T.Resize((128, 128)),
+            T.ToTensor()
+        ])
+        self.to_pil = T.ToPILImage()
+
+    def degrade(self, hr_img):
+        # Bicubic downsample ×4
+        lr_img = T.Resize((32, 32), interpolation=T.InterpolationMode.BICUBIC)(hr_img)
+
+        # Random blur
+        if random.random() < 0.5:
+            lr_img = self.to_pil(lr_img).filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 1.2)))
+            lr_img = T.ToTensor()(lr_img)
+
+        # Add Gaussian noise
+        if random.random() < 0.5:
+            noise = torch.randn_like(lr_img) * 0.05
+            lr_img = torch.clamp(lr_img + noise, 0, 1)
+
+        return lr_img
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.files[idx]).convert("L")  # grayscale
+        hr = self.hr_transform(img)
+        lr = self.degrade(hr)
+        return lr, hr
+
+# =====================
+# Model (simple residual CNN with upscaling)
+# =====================
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+
+    def forward(self, x):
+        return x + self.conv2(self.relu(self.conv1(x)))
+
+class SRNet(nn.Module):
+    def __init__(self, num_residuals=8):
+        super().__init__()
+        self.entry = nn.Conv2d(1, 64, 3, padding=1)
+        self.res_blocks = nn.Sequential(*[ResidualBlock(64) for _ in range(num_residuals)])
+        self.upsample2 = nn.Sequential(
+            nn.Conv2d(64, 256, 3, padding=1),
+            nn.PixelShuffle(2),
+            nn.ReLU(True)
+        )
+        self.upsample4 = nn.Sequential(
+            nn.Conv2d(64, 256, 3, padding=1),
+            nn.PixelShuffle(2),
+            nn.ReLU(True)
+        )
+        self.exit = nn.Conv2d(64, 1, 3, padding=1)
+
+    def forward(self, x):
+        feat = self.entry(x)
+        feat = self.res_blocks(feat)
+        x2 = self.upsample2(feat)
+        x4 = self.upsample4(x2)
+        out = self.exit(x4)
+        return x2, out
+
+# =====================
+# Loss functions
+# =====================
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, vgg_path):
+        super().__init__()
+        vgg19 = models.vgg19()
+        vgg19.load_state_dict(torch.load(vgg_path))
+        features = list(vgg19.features)[:36]
+        self.vgg = nn.Sequential(*features).eval()
+        for p in self.vgg.parameters():
+            p.requires_grad = False
+
+    def forward(self, sr, hr):
+        sr = sr.repeat(1, 3, 1, 1)
+        hr = hr.repeat(1, 3, 1, 1)
+        f_sr = self.vgg(sr)
+        f_hr = self.vgg(hr)
+        return nn.functional.l1_loss(f_sr, f_hr)
+
+# =====================
+# Utilities
+# =====================
+def save_image_grid(lr, sr2, sr4, hr, epoch, folder="./sr_logs"):
+    os.makedirs(folder, exist_ok=True)
+    grid = torch.cat([lr, sr2, sr4, hr], dim=3)
+    grid = (grid.clamp(0,1).squeeze().cpu().numpy()*255).astype(np.uint8)
+    Image.fromarray(grid).save(os.path.join(folder, f"epoch_{epoch}.jpg"))
+
+# =====================
+# Training Loop
+# =====================
+def train():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dataset = AircraftDataset("./aircraft_crops")
+    train_len = int(0.8 * len(dataset))
+    val_len = len(dataset) - train_len
+    train_ds, val_ds = random_split(dataset, [train_len, val_len])
+
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=8)
+
+    model = SRNet().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, 50, 0.5)
+    vgg_loss_fn = VGGPerceptualLoss("./pretrained/vgg19-dcbb9e9d.pth").to(device)
+    l1 = nn.L1Loss()
+
+    # Resume logic
+    ckpt_dir = "./checkpoints"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    latest_ckpt = None
+    start_epoch = 0
+    ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "*.pth")))
+    if ckpts:
+        latest_ckpt = ckpts[-1]
+        checkpoint = torch.load(latest_ckpt)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optim_state"])
+        scheduler.load_state_dict(checkpoint["sched_state"])
+        start_epoch = checkpoint["epoch"] + 1
+        print(f"[INFO] Resuming from {latest_ckpt}, epoch {checkpoint['epoch']}")
+    else:
+        print("[INFO] No checkpoint found, starting fresh training.")
+
+    epochs = 100
+    for epoch in range(start_epoch, epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+        for lr, hr in pbar:
+            lr, hr = lr.to(device), hr.to(device)
+            sr2, sr4 = model(lr)
+            loss_l1 = l1(sr4, hr)
+            loss_vgg = vgg_loss_fn(sr4, hr)
+            loss = loss_l1 + 0.1 * loss_vgg
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            pbar.set_postfix({"loss": loss.item()})
+
+        scheduler.step()
+
+        # Save checkpoint
+        if (epoch+1) % 5 == 0:
+            ckpt_path = os.path.join(ckpt_dir, f"ckpt_epoch{epoch+1}.pth")
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optim_state": optimizer.state_dict(),
+                "sched_state": scheduler.state_dict()
+            }, ckpt_path)
+            print(f"[INFO] Saved checkpoint: {ckpt_path}")
+
+        # Save sample visuals
+        lr, hr = next(iter(val_loader))
+        lr, hr = lr.to(device), hr.to(device)
+        with torch.no_grad():
+            sr2, sr4 = model(lr)
+        save_image_grid(lr[0:1], sr2[0:1], sr4[0:1], hr[0:1], epoch+1)
+
+# =====================
+# Inference
+# =====================
+def infer(scale=4):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = SRNet().to(device)
+    ckpts = sorted(glob.glob("./checkpoints/*.pth"))
+    if not ckpts:
+        raise FileNotFoundError("No checkpoints found!")
+    latest_ckpt = ckpts[-1]
+    checkpoint = torch.load(latest_ckpt)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+    print(f"[INFO] Loaded {latest_ckpt} for inference.")
+
+    os.makedirs("./sr_results", exist_ok=True)
+    dataset = AircraftDataset("./aircraft_crops")
+    loader = DataLoader(dataset, batch_size=1)
+    for i, (lr, hr) in enumerate(loader):
+        lr = lr.to(device)
+        with torch.no_grad():
+            sr2, sr4 = model(lr)
+            sr = sr2 if scale == 2 else sr4
+        img = sr.clamp(0,1).squeeze().cpu().numpy()*255
+        Image.fromarray(img.astype(np.uint8)).save(f"./sr_results/img_{i}_x{scale}.jpg")
+
+# =====================
+# Main
+# =====================
+if __name__ == "__main__":
+    mode = "train"  # "train" or "infer"
+    if mode == "train":
+        train()
+    else:
+        infer(scale=4)
