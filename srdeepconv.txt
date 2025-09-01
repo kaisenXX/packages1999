@@ -1,0 +1,342 @@
+import os
+import glob
+import random
+import numpy as np
+from PIL import Image, ImageFilter
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+import torchvision.transforms as T
+import torchvision.models as models
+
+# =====================
+# Config
+# =====================
+DATA_DIR = "./aircraft_crops"
+PRETRAINED_VGG = r"C:\Users\sachi\Desktop\New folder (9)\pretrained\vgg19-dcbb9e9d.pth"
+CKPT_DIR = "./checkpoints"
+LOG_DIR = "./sr_logs"
+RESULT_DIR = "./sr_results"
+HR_SIZE = 100
+SCALE = 4
+BATCH_SIZE = 8
+EPOCHS = 5
+LR = 1e-5                       # lowered LR to stabilize training after architecture changes
+USE_DEGRADE = True
+VAL_SPLIT = 0.2
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =====================
+# Dataset
+# =====================
+class AircraftDataset(Dataset):
+    def __init__(self, root, hr_size=HR_SIZE, scale=SCALE, use_degrade=USE_DEGRADE):
+        self.files = sorted(
+            glob.glob(os.path.join(root, "*.jpeg"))
+            + glob.glob(os.path.join(root, "*.jpg"))
+            + glob.glob(os.path.join(root, "*.png"))
+        )
+        self.hr_size = hr_size
+        self.scale = scale
+        self.use_degrade = use_degrade
+
+        self.hr_transform = T.Compose([
+            T.Resize((hr_size, hr_size), interpolation=Image.BICUBIC),
+            T.ToTensor()
+        ])
+        self.lr_bicubic = T.Compose([
+            T.Resize((hr_size // scale, hr_size // scale), interpolation=Image.BICUBIC),
+            T.ToTensor()
+        ])
+
+    def degrade(self, hr_tensor):
+        # hr_tensor: [3,H,W]
+        pil_hr = T.ToPILImage()(hr_tensor)
+        lr_w = self.hr_size // self.scale
+        lr_h = self.hr_size // self.scale
+        pil_lr = pil_hr.resize((lr_w, lr_h), resample=Image.BICUBIC)
+        if random.random() < 0.5:
+            pil_lr = pil_lr.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 1.2)))
+        lr_tensor = T.ToTensor()(pil_lr)
+        if random.random() < 0.5:
+            noise = torch.randn_like(lr_tensor) * 0.05
+            lr_tensor = torch.clamp(lr_tensor + noise, 0.0, 1.0)
+        return lr_tensor
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        # normalize format: convert to RGB (safe for grayscale or RGB)
+        img = Image.open(self.files[idx]).convert("RGB")
+        hr = self.hr_transform(img)  # [3, HR, HR]
+        if self.use_degrade:
+            lr = self.degrade(hr)    # [3, HR/scale, HR/scale]
+        else:
+            lr = self.lr_bicubic(img)
+        return lr, hr
+
+# =====================
+# Model + initialization
+# =====================
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1)
+        )
+    def forward(self, x):
+        return x + 0.1 * self.block(x)   # residual scaling
+
+class SRNet(nn.Module):
+    def __init__(self, num_residuals=16):
+        super().__init__()
+        self.entry = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.res_blocks = nn.Sequential(*[ResidualBlock(64) for _ in range(num_residuals)])
+        # upsample stacks with small refinements
+        self.upsample2 = nn.Sequential(
+            nn.Conv2d(64, 256, 3, padding=1),
+            nn.PixelShuffle(2),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.exit2 = nn.Conv2d(64, 3, 3, padding=1)
+        self.upsample4 = nn.Sequential(
+            nn.Conv2d(64, 256, 3, padding=1),
+            nn.PixelShuffle(2),
+            nn.ReLU(True),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.exit4 = nn.Conv2d(64, 3, 3, padding=1)
+        # final clamp to [0,1]
+        self.final_act = nn.Sigmoid()
+        self._init_weights()
+
+    def _init_weights(self):
+        # Kaiming init for convs
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        feat = self.entry(x)
+        feat = self.res_blocks(feat)
+        feat2 = self.upsample2(feat)
+        out2 = self.final_act(self.exit2(feat2))
+        feat4 = self.upsample4(feat2)
+        out4 = self.final_act(self.exit4(feat4))
+        return out2, out4
+
+# =====================
+# VGG perceptual loss (expects inputs normalized to ImageNet)
+# =====================
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, vgg_path):
+        super().__init__()
+        vgg19 = models.vgg19()
+        vgg19.load_state_dict(torch.load(vgg_path))
+        features = list(vgg19.features)[:36]
+        self.vgg = nn.Sequential(*features).eval()
+        for p in self.vgg.parameters():
+            p.requires_grad = False
+        # ImageNet normalization tensors
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1).to(DEVICE)
+        self.std  = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1).to(DEVICE)
+
+    def forward(self, sr, hr):
+        # sr/hr are in [0,1], convert to ImageNet norm
+        sr_n = (sr - self.mean) / self.std
+        hr_n = (hr - self.mean) / self.std
+        f_sr = self.vgg(sr_n)
+        f_hr = self.vgg(hr_n)
+        # debug once
+        if not hasattr(self, "_printed"):
+            print("[DEBUG] VGG features shapes:", f_sr.shape, f_hr.shape)
+            self._printed = True
+        return F.l1_loss(f_sr, f_hr)
+
+# =====================
+# Edge ops
+# =====================
+def sobel_edges(x):
+    x_gray = torch.mean(x, dim=1, keepdim=True)
+    sobel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(0)
+    sobel_y = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(0)
+    gx = F.conv2d(x_gray, sobel_x, padding=1)
+    gy = F.conv2d(x_gray, sobel_y, padding=1)
+    return torch.sqrt(gx*gx + gy*gy + 1e-6)
+
+def laplacian_edges(x):
+    x_gray = torch.mean(x, dim=1, keepdim=True)
+    lap = torch.tensor([[0,1,0],[1,-4,1],[0,1,0]], dtype=torch.float32, device=x.device).unsqueeze(0).unsqueeze(0)
+    return F.conv2d(x_gray, lap, padding=1)
+
+# =====================
+# Utilities
+# =====================
+def save_image_grid(lr, sr2, sr4, hr, epoch, folder=LOG_DIR):
+    os.makedirs(folder, exist_ok=True)
+    H = hr.shape[-2]; W = hr.shape[-1]
+    lr_up = F.interpolate(lr, size=(H,W), mode="bicubic", align_corners=False)
+    sr2_up = F.interpolate(sr2, size=(H,W), mode="bicubic", align_corners=False)
+    grid = torch.cat([lr_up[0], sr2_up[0], sr4[0], hr[0]], dim=-1)
+    grid = (grid.clamp(0,1).permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
+    Image.fromarray(grid).save(os.path.join(folder, f"epoch_{epoch:04d}.jpeg"))
+
+# =====================
+# Training
+# =====================
+def train():
+    device = DEVICE
+    dataset = AircraftDataset(DATA_DIR, hr_size=HR_SIZE, scale=SCALE, use_degrade=USE_DEGRADE)
+    n_total = len(dataset)
+    if n_total == 0:
+        raise RuntimeError(f"No images found in {DATA_DIR}")
+    n_val = max(1, int(n_total * VAL_SPLIT))
+    n_train = n_total - n_val
+    train_ds, val_ds = random_split(dataset, [n_train, n_val])
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    model = SRNet().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    vgg_loss_fn = VGGPerceptualLoss(PRETRAINED_VGG).to(device)
+    l1 = nn.L1Loss()
+
+    # --- Auto resume with safe handling ---
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    start_epoch = 0
+    ckpts = sorted(glob.glob(os.path.join(CKPT_DIR, "*.pth")))
+    if ckpts:
+        latest = ckpts[-1]
+        print(f"[INFO] Found checkpoint: {latest}. Attempting to load...")
+        ckpt = torch.load(latest, map_location=device)
+        try:
+            # try strict load (resume training exactly)
+            model.load_state_dict(ckpt["model_state"])
+            optimizer.load_state_dict(ckpt["optim_state"])
+            scheduler.load_state_dict(ckpt["sched_state"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            print(f"[INFO] Strictly resumed from {latest}, starting at epoch {start_epoch}")
+        except Exception as e:
+            # fallback: load partially (strict=False) and start fresh
+            print("[WARN] Strict load failed (architecture changed). Error:", e)
+            print("[WARN] Loading weights with strict=False (will skip mismatched layers). Starting training from scratch to avoid incompatible optimizer state.")
+            res = model.load_state_dict(ckpt["model_state"], strict=False)
+            print("[WARN] Loaded with strict=False. Missing keys:", res.missing_keys)
+            print("[WARN] Loaded with strict=False. Unexpected keys:", res.unexpected_keys)
+            start_epoch = 0
+    else:
+        print("[INFO] No checkpoint found - training from scratch.")
+
+    # Training loop
+    for epoch in range(start_epoch, EPOCHS):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        for step, (lr_img, hr_img) in enumerate(pbar):
+            lr_img, hr_img = lr_img.to(device), hr_img.to(device)
+
+            sr2, sr4 = model(lr_img)
+            hr_half = F.interpolate(hr_img, scale_factor=0.5, mode="bicubic", align_corners=False)
+
+            # losses
+            loss_l1 = l1(sr2, hr_half) + l1(sr4, hr_img)
+            loss_vgg = vgg_loss_fn(sr4, hr_img)
+            edges_sr = sobel_edges(sr4); edges_hr = sobel_edges(hr_img)
+            edges_sr_l = laplacian_edges(sr4); edges_hr_l = laplacian_edges(hr_img)
+            loss_edge = F.l1_loss(edges_sr, edges_hr) + F.l1_loss(edges_sr_l, edges_hr_l)
+
+            # balanced loss weights (safer)
+            loss = 0.5 * loss_l1 + 0.1 * loss_vgg + 0.3 * loss_edge
+
+            optimizer.zero_grad()
+            loss.backward()
+            # optional grad clipping to stabilize deep net
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # debug sr range occasionally
+            if step % 20 == 0:
+                with torch.no_grad():
+                    mn, mx = sr4.min().item(), sr4.max().item()
+                pbar.set_postfix({"loss": f"{loss.item():.4f}", "sr_min": f"{mn:.4f}", "sr_max": f"{mx:.4f}"})
+            else:
+                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        scheduler.step()
+
+        # validation preview
+        model.eval()
+        with torch.no_grad():
+            try:
+                lr_v, hr_v = next(iter(val_loader))
+                lr_v, hr_v = lr_v.to(device), hr_v.to(device)
+                sr2_v, sr4_v = model(lr_v)
+                save_image_grid(lr_v, sr2_v, sr4_v, hr_v, epoch+1)
+            except StopIteration:
+                pass
+
+        # Save checkpoint (always save model_state; optimizer saved only if training resumed successfully)
+        ckpt_path = os.path.join(CKPT_DIR, f"ckpt_epoch{epoch+1:04d}.pth")
+        torch.save({
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optim_state": optimizer.state_dict(),
+            "sched_state": scheduler.state_dict()
+        }, ckpt_path)
+        print(f"[INFO] Saved checkpoint: {ckpt_path}")
+
+# =====================
+# Inference (safe loading)
+# =====================
+def infer(img_path, ckpt_path, which="4x"):
+    device = DEVICE
+    model = SRNet().to(device)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    # try strict load; if fails, load partial and warn
+    try:
+        model.load_state_dict(ckpt["model_state"])
+        print("[INFO] Loaded checkpoint strictly.")
+    except Exception as e:
+        print("[WARN] Strict load failed:", e)
+        res = model.load_state_dict(ckpt["model_state"], strict=False)
+        print("[WARN] Loaded with strict=False. Missing:", res.missing_keys)
+        print("[WARN] Unexpected:", res.unexpected_keys)
+
+    model.eval()
+    img = Image.open(img_path).convert("RGB")
+    # treat input as LR; if originally HR, you may need to downsample externally
+    lr = T.ToTensor()(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        sr2, sr4 = model(lr)
+        sr = sr2 if which == "2x" else sr4
+
+    # ensure in [0,1], convert to uint8
+    arr = sr.clamp(0,1)[0].permute(1,2,0).cpu().numpy()
+    arr = (arr * 255).astype(np.uint8)
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    out_path = os.path.join(RESULT_DIR, f"sr_{which}.png")
+    Image.fromarray(arr).save(out_path)
+    print(f"[INFO] Saved SR to: {out_path}")
+
+if __name__ == "__main__":
+    train()
+    # Example inference after training:
+    # infer("./aircraft_crops/some_crop.jpeg", "./checkpoints/ckpt_epoch0005.pth", which="4x")
