@@ -1,0 +1,223 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import tifffile
+import numpy as np
+from tqdm import tqdm
+import math
+from skimage.metrics import peak_signal_noise_ratio as compare_psnr
+from skimage.metrics import structural_similarity as compare_ssim
+
+
+# ==========================
+# Dataset Preparation
+# ==========================
+class AircraftDataset(Dataset):
+    def __init__(self, root_dir, hr_size=128, scale=4):
+        self.root_dir = root_dir
+        self.image_files = [f for f in os.listdir(root_dir) if f.lower().endswith(('.tif', '.tiff'))]
+        self.hr_size = hr_size
+        self.scale = scale
+
+        self.hr_transform = transforms.Compose([
+            transforms.Resize((hr_size, hr_size)),
+            transforms.ToTensor()
+        ])
+        self.lr_transform = transforms.Compose([
+            transforms.Resize((hr_size//scale, hr_size//scale)),
+            transforms.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.root_dir, self.image_files[idx])
+
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except:
+            img_data = tifffile.imread(img_path)
+            img = Image.fromarray(img_data).convert("RGB")
+
+        hr = self.hr_transform(img)
+        lr = self.lr_transform(img)
+        return lr, hr
+
+
+# ==========================
+# Real-ESRGAN Generator
+# ==========================
+class ResidualDenseBlock(nn.Module):
+    def __init__(self, nf, gc=32):
+        super(ResidualDenseBlock, self).__init__()
+        from torch.nn import Conv2d, LeakyReLU
+        self.conv1 = Conv2d(nf, gc, 3, 1, 1)
+        self.conv2 = Conv2d(nf+gc, gc, 3, 1, 1)
+        self.conv3 = Conv2d(nf+2*gc, gc, 3, 1, 1)
+        self.conv4 = Conv2d(nf+3*gc, gc, 3, 1, 1)
+        self.conv5 = Conv2d(nf+4*gc, nf, 3, 1, 1)
+        self.lrelu = LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x):
+        x1 = self.lrelu(self.conv1(x))
+        x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))
+        x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
+        x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
+        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
+        return x5 * 0.2 + x
+
+
+class ResidualInResidualDenseBlock(nn.Module):
+    def __init__(self, nf, gc=32):
+        super(ResidualInResidualDenseBlock, self).__init__()
+        self.RDB1 = ResidualDenseBlock(nf, gc)
+        self.RDB2 = ResidualDenseBlock(nf, gc)
+        self.RDB3 = ResidualDenseBlock(nf, gc)
+
+    def forward(self, x):
+        out = self.RDB1(x)
+        out = self.RDB2(out)
+        out = self.RDB3(out)
+        return x + out * 0.2
+
+
+class RRDBNet(nn.Module):
+    def __init__(self, in_nc=3, out_nc=3, nf=64, nb=3, gc=32):
+        super(RRDBNet, self).__init__()
+        from torch.nn import Conv2d, LeakyReLU, Sequential
+        self.conv_first = Conv2d(in_nc, nf, 3, 1, 1, bias=True)
+        self.RRDB_trunk = Sequential(*[ResidualInResidualDenseBlock(nf, gc) for _ in range(nb)])
+        self.trunk_conv = Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.upconv1 = Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.upconv2 = Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.HRconv = Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.conv_last = Conv2d(nf, out_nc, 3, 1, 1, bias=True)
+        self.lrelu = LeakyReLU(negative_slope=0.2, inplace=True)
+
+    def forward(self, x):
+        fea = self.conv_first(x)
+        trunk = self.trunk_conv(self.RRDB_trunk(fea))
+        fea = fea + trunk
+        fea = self.lrelu(self.upconv1(nn.functional.interpolate(fea, scale_factor=2, mode='nearest')))
+        fea = self.lrelu(self.upconv2(nn.functional.interpolate(fea, scale_factor=2, mode='nearest')))
+        out = self.conv_last(self.lrelu(self.HRconv(fea)))
+        return out
+
+
+# ==========================
+# Training Function
+# ==========================
+def train(pretrained_path, data_dir, epochs=5, batch_size=4, hr_size=128, scale=4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dataset = AircraftDataset(data_dir, hr_size=hr_size, scale=scale)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    model = RRDBNet(nb=3)
+    if pretrained_path and os.path.exists(pretrained_path):
+        model.load_state_dict(torch.load(pretrained_path), strict=False)
+        print("[INFO] Loaded pretrained weights.")
+    model = model.to(device)
+    model.train()
+
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+    for epoch in range(epochs):
+        loop = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+        for lr_imgs, hr_imgs in loop:
+            lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
+
+            sr_imgs = model(lr_imgs)
+            loss = criterion(sr_imgs, hr_imgs)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loop.set_postfix(loss=loss.item())
+
+    torch.save(model.state_dict(), "fine_tuned_aircraft_sr.pth")
+    print("[INFO] Training completed and model saved as fine_tuned_aircraft_sr.pth")
+
+
+# ==========================
+# Testing & Evaluation
+# ==========================
+def test_sr_model(pretrained_path, test_dir, save_dir="./sr_test_results", hr_size=128, scale=4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = RRDBNet(nb=3)
+    model.load_state_dict(torch.load(pretrained_path), strict=False)
+    model = model.to(device)
+    model.eval()
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    transform = transforms.Compose([
+        transforms.Resize((hr_size//scale, hr_size//scale)),
+        transforms.ToTensor()
+    ])
+    hr_transform = transforms.Compose([
+        transforms.Resize((hr_size, hr_size)),
+        transforms.ToTensor()
+    ])
+
+    test_files = [f for f in os.listdir(test_dir) if f.lower().endswith(('.tif', '.tiff'))]
+
+    print(f"[INFO] Testing {len(test_files)} images from {test_dir}")
+
+    psnr_list, ssim_list = [], []
+
+    with torch.no_grad():
+        for img_name in tqdm(test_files, desc="Testing SR"):
+            img_path = os.path.join(test_dir, img_name)
+            try:
+                img = Image.open(img_path).convert("RGB")
+            except:
+                img_data = tifffile.imread(img_path)
+                img = Image.fromarray(img_data).convert("RGB")
+
+            lr = transform(img).unsqueeze(0).to(device)
+            hr = hr_transform(img).permute(1,2,0).numpy()
+
+            sr = model(lr)
+            sr_img = sr.squeeze(0).clamp(0, 1).permute(1, 2, 0).cpu().numpy()
+
+            sr_img_uint8 = (sr_img * 255).astype("uint8")
+            hr_uint8 = (hr * 255).astype("uint8")
+
+            psnr_val = compare_psnr(hr_uint8, sr_img_uint8, data_range=255)
+            ssim_val = compare_ssim(hr_uint8, sr_img_uint8, multichannel=True, data_range=255)
+
+            psnr_list.append(psnr_val)
+            ssim_list.append(ssim_val)
+
+            out_path = os.path.join(save_dir, img_name.replace(".tif", "_sr.png").replace(".tiff", "_sr.png"))
+            Image.fromarray(sr_img_uint8).save(out_path)
+
+    avg_psnr = sum(psnr_list) / len(psnr_list)
+    avg_ssim = sum(ssim_list) / len(ssim_list)
+
+    print(f"[RESULTS] Average PSNR: {avg_psnr:.4f}, Average SSIM: {avg_ssim:.4f}")
+
+
+# ==========================
+# Main
+# ==========================
+if __name__ == "__main__":
+    pretrained_weights = "RealESRGAN_x4plus.pth"  # downloaded weights
+    data_directory = "./aircraft_crops_tiff"     # your TIFF aircraft crops folder
+
+    print("[STEP] Starting training...")
+    train(pretrained_weights, data_directory, epochs=5, batch_size=4)
+
+    print("[STEP] Starting testing and evaluation...")
+    test_sr_model("fine_tuned_aircraft_sr.pth", data_directory)
+
+
+
