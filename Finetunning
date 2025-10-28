@@ -4,7 +4,8 @@ import numpy as np
 img = tiff.imread("sample.tif")
 print("Image shape:", img.shape)  # (H, W, C)
 print("Data type:", img.dtype)
-
+https://limewire.com/d/s6cos#oo1oL4lLrA
+https://limewire.com/d/ShITH#s5odajE7D6
 import os
 import torch
 import torch.nn as nn
