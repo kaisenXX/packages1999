@@ -1,5 +1,6 @@
 import tifffile as tiff
 import numpy as np
+https://filebin.net/eucmtk903vvxaby9
 
 img = tiff.imread("sample.tif")
 print("Image shape:", img.shape)  # (H, W, C)
